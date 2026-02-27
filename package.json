@@ -1,0 +1,22 @@
+{
+  "name": "photo-app-wsf",
+  "version": "1.0.0",
+  "description": "Secure HTTPS Express server for a photo sharing app",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "express",
+    "https",
+    "helmet",
+    "security",
+    "photo-sharing"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.21.2",
+    "helmet": "^7.2.0"
+  }
+}
