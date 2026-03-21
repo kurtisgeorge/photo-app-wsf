@@ -1,41 +1,40 @@
-# Photo App HTTPS Server
+# Photo App WSF - Phase 2 (Auth & Security)
 
-Simple Express API running on HTTPS for local dev.
-
-## Files
-
-- `server.js` - API routes + HTTPS server
-- `package.json` - scripts and deps
-- `certs/` - local SSL cert and key
+Express API for a photo-sharing app with authentication, RBAC, and secure session handling.
 
 ## Requirements
 
 - Node.js 18+
 - npm
-- OpenSSL
+- OpenSSL (for local HTTPS)
+- Google Cloud Console credentials (for OAuth)
 
 ## Run it
 
-1. Install deps:
+1. Install dependencies:
 
 ```bash
 npm install
 ```
 
-2. Make cert folder:
+2. Make cert folder and generate local certs (if you havent already):
 
 ```bash
 mkdir -p certs
-```
-
-3. Generate local certs:
-
-```bash
 openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout certs/localhost-key.pem \
   -out certs/localhost-cert.pem \
   -days 365 \
   -subj "/CN=localhost"
+```
+
+3. Set up environment variables:
+Create a `.env` file in the root folder and add your secrets:
+
+```ini
+JWT_SECRET=your_super_secret_jwt_string
+GOOGLE_CLIENT_ID=your_google_client_id
+GOOGLE_CLIENT_SECRET=your_google_client_secret
 ```
 
 4. Start:
@@ -44,30 +43,29 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 npm start
 ```
 
-5. Test:
+## Authentication Mechanisms
 
-```bash
-curl -k https://localhost:3000/health
-curl -k https://localhost:3000/posts
-```
+- **Local Auth:** Uses `bcryptjs` to hash passwords on registration. When logging in, it compares the entered password against the stored hash.
+- **SSO:** Google OAuth 2.0 lets users sign in with Google instead of making a new password.
+- **Sessions (JWT):** After a successful login (either local or Google), the server generates a JSON Web Token (JWT) containing the user's ID and role. This gets sent to the client inside a secure, `HttpOnly` cookie.
 
-Open `https://localhost:3000` in browser after that.
+## Role-Based Access Control (RBAC)
 
-## Notes
+Access is controlled with middleware that checks the role payload inside the user's JWT.
 
-- Self-signed cert is for local only, browser warning is expected.
-- If cert files are missing, server exits and tells you paths.
-- Helmet is on.
-- Cache headers are set per route in `server.js`.
+- **Roles:** `User` (standard access) and `Admin` (elevated access).
+- **`/profile`:** Protected route. Any authenticated user can hit this to see their own info.
+- **`/admin`:** Highly protected route. Only accessible if your JWT says you are an Admin. Normal users get bounced with a 403 Forbidden.
+- **`/dashboard`:** Shared route. Shows different data depending on whether the JWT belongs to a User or an Admin.
 
 ## Reflections / Lessons Learned
 
-I picked a photo sharing API because it made the Phase 1 security work easier to reason about. In this kind of app, some data is clearly public (posts, tags, public profile views) and some data is clearly not (user-specific feed behavior, admin-ish endpoints, and write actions). That split made caching decisions way less confusing. I could look at each route and decide if short-term caching is fine or if it absolutely should not be stored.
+I used both local auth and Google OAuth. I wanted local login there as a backup since it is simple and easy to control, but Google sign-in makes the app way less annoying to use. That choice was mostly based on what I usually expect as a user too. If a site gives me a quick sign-in option, I will probably use that instead of making another password.
 
-For SSL, OpenSSL self-signed certs were the practical choice for local development. I didn’t need domain setup, DNS, or any external config. I just needed local HTTPS working so I could test the real behavior. The downside is the browser warning, which is expected but still annoying the first time. Safari was especially confusing because it looks like everything is blocked even when the server is up. The biggest real issue was cert paths and filenames. The app expects `certs/localhost-key.pem` and `certs/localhost-cert.pem`, and if those are missing, startup fails immediately. I hit that more than once while iterating. In production, this would be a bad experience for users, so I’d use a trusted certificate provider like Let’s Encrypt.
+For access control, I kept it simple with just `User` and `Admin` roles. That felt like enough for this app without making the whole thing harder than it needed to be. I stored the role with the user and passed it into the JWT so the middleware could check it on the protected routes I set up. The main challenge was making sure the checks were strict enough without making normal users hit weird permission issues all the time.
 
-Helmet did exactly what I needed here: a good base without writing a lot of custom header code. I verified behavior with curl and checked that key headers were present: `Content-Security-Policy`, `X-Frame-Options` (plus `frame-ancestors` behavior via CSP), `Referrer-Policy`, `Strict-Transport-Security`, and `X-Content-Type-Options`. In practical terms, CSP helps block injected scripts and unsafe resource loading, frame protections reduce clickjacking risk, referrer policy limits how much URL info leaks to other sites, HSTS pushes browsers to stay on HTTPS, and nosniff reduces weird content-type sniffing problems. This doesn’t make the app magically “secure,” but it closes common holes early.
+I stored the JWT in an `HttpOnly` cookie because I didn't want it sitting in `localStorage`. That felt safer for XSS reasons, even if the setup was a bit more annoying. The main trade-off was dealing with cookie settings and making sure the token still worked cleanly during local testing. It took a bit of messing around to get the middleware and cookie handling working the way I wanted.
 
-The most frustrating debugging issues were simple but real. I saw the server exit on missing cert files until I fixed folder/file names. I got tripped up by Safari’s self-signed warning and had to verify with `curl -k` to confirm the API was actually running. I also hit `Cannot GET /` when testing in the browser and realized that having only API routes is fine for curl, but the assignment says to navigate to the root URL, so the root route (hahaha) needed to exist and show something useful. Another mistake was testing POST routes with GET checks; write routes need `POST` requests (`curl -X POST ...`) or they won’t run. I also lost time forgetting to restart the server after edits and then wondering why changes “didn’t work.”
+The biggest security risks I focused on were CSRF, brute force login attempts, and session fixation. I added rate limiting on the login route, used CSRF protection, and regenerated the session on login so old session data would not carry over. The trickiest part was getting the cookie settings like `Secure` and `SameSite` to behave on localhost without breaking everything.
 
-Caching was the biggest trade-off decision. `GET /posts` uses `public, max-age=300, stale-while-revalidate=60`, and `GET /posts/:id` uses `public, max-age=300`. That gives better response speed for public read endpoints where a little downtime is acceptable. Write routes are `no-store` because caching state-changing responses can cause wrong behavior and privacy problems. User-specific or admin-style routes also stay `no-store` for the same reason. So the final approach is simple: cache what is safely public and read-only, never cache what is sensitive or mutating state.
+For testing, I mostly did manual checks on the main auth flow. I tested login, logout, token expiry, and tried hitting `/admin` with a regular user to make sure it got blocked with a 403. I also checked the browser dev tools a lot to make sure the cookies had the right flags set. I fixed cookie and token issues first because if those are wrong, the whole auth system feels broken right away.
