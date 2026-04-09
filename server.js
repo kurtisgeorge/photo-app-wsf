@@ -281,10 +281,10 @@ app.get('/dashboard', authenticateJWT, (req, res) => {
 
 // validation rules per assignment requirements
 const profileValidation = [
-  body('name')
+  body('username')
     .trim()
-    .isLength({ min: 3, max: 50 }).withMessage('Name must be 3–50 characters.')
-    .matches(/^[A-Za-z\s]+$/).withMessage('Name must contain only letters and spaces.'),
+    .isLength({ min: 3, max: 50 }).withMessage('Username must be 3–50 characters.')
+    .matches(/^[A-Za-z0-9._-]+$/).withMessage('Username must contain only letters, numbers, ., _, -'),
 
   body('email')
     .trim()
@@ -334,16 +334,28 @@ app.post('/dashboard/update', authenticateJWT, profileValidation, (req, res) => 
   }
 
   // sanitized values via express-validator
-  const { name, email, bio } = req.body;
+  const { username, email, bio } = req.body;
+
+  if (username.toLowerCase() !== user.username.toLowerCase()) {
+    const existingUser = users.find((u) => u.username.toLowerCase() === username.toLowerCase());
+    if (existingUser) {
+      req.session.flash = {
+        type: 'error',
+        message: 'Username already exists.',
+        errors: { username: 'Username already exists.' }
+      };
+      return req.session.save(() => res.redirect('/dashboard'));
+    }
+  }
 
   // encrypt and store
-  user.name = name;
+  user.username = username;
+  user.name = username;
   user.email = encrypt(email);
   user.bio = encrypt(bio || '');
 
   // logging for demo check
   console.log(`[Profile Updated] user=${user.username}`);
-  console.log(`  name (plain): ${user.name}`);
   console.log(`  email (encrypted): ${user.email}`);
   console.log(`  bio (encrypted): ${user.bio}`);
 
@@ -485,9 +497,10 @@ passport.use(
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
       callbackURL: `https://localhost:${PORT}/auth/google/callback`
     },
-    (accessToken, refreshToken, profile, done) => {
+      (accessToken, refreshToken, profile, done) => {
       const googleId = profile.id;
       const displayName = profile.displayName;
+      const email = (profile.emails && profile.emails[0] && profile.emails[0].value) || '';
 
       let user = users.find((u) => u.oauthProvider === 'google' && u.oauthId === googleId);
 
@@ -502,7 +515,7 @@ passport.use(
           oauthProvider: 'google',
           oauthId: googleId,
           name: displayName,
-          email: '',
+          email: encrypt(email),
           bio: ''
         };
         users.push(newUser);
@@ -555,12 +568,23 @@ app.get(
 
 // account creation
 app.post('/auth/register', async (req, res) => {
-  const { username, password } = req.body;
+  const { username, email, password } = req.body;
+  const normalizedEmail = email ? email.trim().toLowerCase() : '';
 
-  if (!username || !password) {
+  if (!username || !email || !password) {
     return res.type('html').send(renderRegisterPage({
       csrfToken: req.csrfToken(),
-      error: 'Username and password are required.',
+      error: 'Username, email, and password are required.',
+      success: null
+    }));
+  }
+
+  // Validate email format
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(normalizedEmail)) {
+    return res.type('html').send(renderRegisterPage({
+      csrfToken: req.csrfToken(),
+      error: 'Please enter a valid email address.',
       success: null
     }));
   }
@@ -606,7 +630,7 @@ app.post('/auth/register', async (req, res) => {
       oauthProvider: null,
       oauthId: null,
       name: username,
-      email: '',
+      email: encrypt(normalizedEmail),
       bio: ''
     };
 
@@ -642,14 +666,17 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
   if (!username || !password) {
     return res.type('html').send(renderLoginPage({
       csrfToken: req.csrfToken(),
-      error: 'Username and password are required.'
+      error: 'Username or email and password are required.'
     }));
   }
 
   try {
-    const user = users.find(
-      (u) => u.username.toLowerCase() === username.toLowerCase()
-    );
+    const loginId = username.trim().toLowerCase();
+    const user = users.find((u) => {
+      if (u.username.toLowerCase() === loginId) return true;
+      if (u.email && decrypt(u.email).toLowerCase() === loginId) return true;
+      return false;
+    });
 
     if (!user || !user.hashedPassword) {
       return res.type('html').send(renderLoginPage({

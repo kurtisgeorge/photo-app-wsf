@@ -43,6 +43,18 @@ const renderRegisterPage = ({ csrfToken, error, success }) => {
           </div>
 
           <div class="field">
+            <label for="email">Email</label>
+            <input
+              id="email"
+              name="email"
+              type="email"
+              autocomplete="email"
+              required
+            />
+            <small class="hint">Used for notifications and account recovery.</small>
+          </div>
+
+          <div class="field">
             <label for="password">Password</label>
             <input
               id="password"

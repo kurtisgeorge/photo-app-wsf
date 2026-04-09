@@ -92,7 +92,7 @@ const renderDashboardPage = ({ csrfToken, logoutPath, updatePath, user, flash })
           </div>
           <dl class="profile-list">
             <div class="profile-row">
-              <dt>Name</dt>
+              <dt>Username</dt>
               <dd>${renderValue(userName, 'Not set yet')}</dd>
             </div>
             <div class="profile-row">
@@ -119,16 +119,17 @@ const renderDashboardPage = ({ csrfToken, logoutPath, updatePath, user, flash })
             <input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}" />
 
             <div class="field">
-              <label for="name">Name</label>
+              <label for="username">Username</label>
               <input
-                id="name"
-                name="name"
+                id="username"
+                name="username"
                 type="text"
                 value="${escapeHtml(userName !== 'Account' ? userName : '')}"
-                autocomplete="name"
+                autocomplete="username"
+                required
               />
-              <small class="hint">3–50 letters and spaces only</small>
-              ${fieldError('name')}
+              <small class="hint">3–50 characters (letters, numbers, ., _, -)</small>
+              ${fieldError('username')}
             </div>
 
             <div class="field">
@@ -140,8 +141,9 @@ const renderDashboardPage = ({ csrfToken, logoutPath, updatePath, user, flash })
                 value="${escapeHtml(profileEmail)}"
                 placeholder="name@example.com"
                 autocomplete="email"
+                required
               />
-              <small class="hint">Standard email format</small>
+              <small class="hint">Used for notifications and account recovery.</small>
               ${fieldError('email')}
             </div>
 

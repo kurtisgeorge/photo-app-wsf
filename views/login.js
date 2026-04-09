@@ -30,7 +30,7 @@ const renderLoginPage = ({ csrfToken, error }) => {
           <input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}" />
 
           <div class="field">
-            <label for="username">Username</label>
+            <label for="username">Username or Email</label>
             <input
               id="username"
               name="username"
