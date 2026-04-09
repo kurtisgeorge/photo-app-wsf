@@ -1,23 +1,56 @@
-# Photo App WSF - Phase 2 (Auth & Security)
+# Photo App WSF - Phase 3 (Dashboard & Data Security)
 
-Express API for a photo-sharing app with authentication, RBAC, and secure session handling.
+Express HTTPS app for a photo-sharing project with a secure user dashboard, profile updates, input validation, output encoding, encrypted profile data, dependency auditing, and automated security checks.
 
 ## Requirements
 
 - Node.js 18+
 - npm
-- OpenSSL (for local HTTPS)
-- Google Cloud Console credentials (for OAuth)
+- OpenSSL for the local HTTPS certificate
+- Google OAuth credentials only if you want to use the Google sign-in flow
 
-## Run it
-
-1. Install dependencies:
+## Clone and Install
 
 ```bash
+git clone <your-repo-url>
+cd photo-app-wsf
 npm install
 ```
 
-2. Make cert folder and generate local certs (if you havent already):
+## Environment Setup
+
+1. Copy the example file:
+
+```bash
+cp .env.example .env
+```
+
+2. Update `.env` with your own local values:
+
+```ini
+JWT_SECRET=replace_with_a_strong_jwt_secret
+GOOGLE_CLIENT_ID=replace_with_google_oauth_client_id
+GOOGLE_CLIENT_SECRET=replace_with_google_oauth_client_secret
+ENCRYPTION_KEY=replace_with_a_64_character_hex_key
+```
+
+`ENCRYPTION_KEY` must be a 64-character hex string (32 bytes). You can generate one with:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+You can generate a JWT secret with:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"
+```
+
+Google OAuth values are optional if you are only using local login.
+
+## HTTPS Certificate Setup
+
+Generate the local certificate files if they do not already exist:
 
 ```bash
 mkdir -p certs
@@ -28,44 +61,127 @@ openssl req -x509 -newkey rsa:2048 -nodes \
   -subj "/CN=localhost"
 ```
 
-3. Set up environment variables:
-Create a `.env` file in the root folder and add your secrets:
-
-```ini
-JWT_SECRET=your_super_secret_jwt_string
-GOOGLE_CLIENT_ID=your_google_client_id
-GOOGLE_CLIENT_SECRET=your_google_client_secret
-```
-
-4. Start:
+## Start the Server
 
 ```bash
 npm start
 ```
 
-## Authentication Mechanisms
+After startup, visit:
 
-- **Local Auth:** Uses `bcryptjs` to hash passwords on registration. When logging in, it compares the entered password against the stored hash.
-- **SSO:** Google OAuth 2.0 lets users sign in with Google instead of making a new password.
-- **Sessions (JWT):** After a successful login (either local or Google), the server generates a JSON Web Token (JWT) containing the user's ID and role. This gets sent to the client inside a secure, `HttpOnly` cookie.
+`https://localhost:3000`
 
-## Role-Based Access Control (RBAC)
+Your browser will warn about the self-signed certificate. Accept it for local development.
 
-Access is controlled with middleware that checks the role payload inside the user's JWT.
+## Dashboard and Profile Flow
 
-- **Roles:** `User` (standard access) and `Admin` (elevated access).
-- **`/profile`:** Protected route. Any authenticated user can hit this to see their own info.
-- **`/admin`:** Highly protected route. Only accessible if your JWT says you are an Admin. Normal users get bounced with a 403 Forbidden.
-- **`/dashboard`:** Shared route. Shows different data depending on whether the JWT belongs to a User or an Admin.
+After login, users are taken to the authenticated home page. From there, they can open their profile dashboard.
 
-## Reflections / Lessons Learned
+The dashboard includes:
+- a welcome message with the user’s name
+- the user’s profile details
+- a profile update form for name, email, and bio
+- a logout button
 
-I used both local auth and Google OAuth. I wanted local login there as a backup since it is simple and easy to control, but Google sign-in makes the app way less annoying to use. That choice was mostly based on what I usually expect as a user too. If a site gives me a quick sign-in option, I will probably use that instead of making another password.
+Dashboard access is protected, and only the logged-in user’s own data is displayed.
 
-For access control, I kept it simple with just `User` and `Admin` roles. That felt like enough for this app without making the whole thing harder than it needed to be. I stored the role with the user and passed it into the JWT so the middleware could check it on the protected routes I set up. The main challenge was making sure the checks were strict enough without making normal users hit weird permission issues all the time.
+## Input Validation
 
-I stored the JWT in an `HttpOnly` cookie because I didn't want it sitting in `localStorage`. That felt safer for XSS reasons, even if the setup was a bit more annoying. The main trade-off was dealing with cookie settings and making sure the token still worked cleanly during local testing. It took a bit of messing around to get the middleware and cookie handling working the way I wanted.
+Profile updates are validated on the server with `express-validator`.
 
-The biggest security risks I focused on were CSRF, brute force login attempts, and session fixation. I added rate limiting on the login route, used CSRF protection, and regenerated the session on login so old session data would not carry over. The trickiest part was getting the cookie settings like `Secure` and `SameSite` to behave on localhost without breaking everything.
+Validation rules:
+- **Name:** 3 to 50 characters, letters and spaces only
+- **Email:** must be a valid email address
+- **Bio:** maximum 500 characters, no HTML tags, no special characters
 
-For testing, I mostly did manual checks on the main auth flow. I tested login, logout, token expiry, and tried hitting `/admin` with a regular user to make sure it got blocked with a 403. I also checked the browser dev tools a lot to make sure the cookies had the right flags set. I fixed cookie and token issues first because if those are wrong, the whole auth system feels broken right away.
+Sanitization is also applied before storing the data. This helps prevent malicious input from being saved in the first place.
+
+Improper input validation can lead to stored XSS, malformed input, and injection-style attacks. In this project, validation and sanitization reduce that risk before the data reaches storage or rendering.
+
+## Output Encoding
+
+User-controlled values are escaped before being inserted into the HTML output. This prevents the browser from interpreting profile data as executable markup or script.
+
+For example, if a user tried to save `<script>alert(1)</script>`, it would be rendered as plain text instead of executing in the browser.
+
+This is important because output encoding is the last line of defense against XSS if malicious input ever gets through validation.
+
+## Encryption
+
+Sensitive profile fields are encrypted at rest before storage:
+- **Email**
+- **Bio**
+
+The app uses AES-256-GCM through Node’s built-in `crypto` module. Encrypted values are decrypted only when needed for the authenticated user’s dashboard view.
+
+Passwords are not encrypted. They are hashed with bcrypt, which is the correct approach for passwords.
+
+Data is also protected in transit because the app runs over HTTPS locally.
+
+One of the main challenges with encryption was keeping the IV, auth tag, and ciphertext together in a format that was easy to store and read back safely. I solved that by storing the encrypted value in a single structured string and decrypting it only at render time.
+
+## Third-Party Dependency Management
+
+I ran `npm audit` to check for dependency vulnerabilities and fixed what was reasonable without breaking the project.
+
+I also added a GitHub Actions workflow to automate security checks on push and pull request. The workflow installs dependencies, runs an audit, and checks for outdated packages.
+
+Using outdated libraries is risky because known vulnerabilities stay in your app until they are patched. Automation helps catch those problems earlier, but it still needs human review because not every suggested update is safe to apply blindly.
+
+## Testing and Debugging
+
+I tested the profile form with malicious input attempts to verify that validation, sanitization, and output encoding were working as expected.
+
+Examples included:
+- script tag payloads in the name and bio fields
+- HTML-based XSS attempts
+- malformed email values
+- injection-style payloads entered through text fields
+
+The main goal was to confirm that:
+- invalid input is rejected
+- dangerous content is not stored
+- rendered output does not execute as code
+
+The most challenging part was making sure the protections worked together properly instead of relying on just one layer. Additional tools like OWASP ZAP, Burp Suite, or more automated tests would improve the process further.
+
+## AI Tools Used
+
+AI tools were used for:
+- dashboard markup and styling
+- form HTML structure
+- implementation support during development
+
+
+## Lessons Learned
+
+**What vulnerabilities can arise from improper input validation?**  
+If input is not validated properly, people can slip in scripts, weird payloads, or just bad data that should never be stored in the first place. In this project, the obvious example was the bio field. If I let HTML through there, someone could store a script and turn it into a stored XSS issue.
+
+**How does output encoding prevent XSS attacks?**  
+Output encoding makes dangerous characters harmless before they get rendered in the browser. So instead of the browser reading `<script>` as actual code, it just shows it as text. In my app that mattered a lot because I was rendering string templates, so I had to be intentional about escaping user data anywhere it showed up.
+
+**What challenges came up with encryption, and how were they resolved?**  
+The main annoying part was making sure the encrypted data was stored in a format that still gave me everything I needed to decrypt it later. I ended up storing the IV, auth tag, and ciphertext together as one colon-separated value, which kept it simple. I also made sure the encryption key stayed in environment variables instead of hardcoding it anywhere.
+
+**Why is it risky to use outdated third-party libraries?**  
+Because if a package already has a known vulnerability, you are basically leaving that door open until you deal with it. In this project I ran into that with dependency audit results, and it was a good reminder that even small packages can create real security problems if they are ignored.
+
+**How does automation help with dependency management, and what risks does automation introduce?**  
+Automation is useful because it catches problems earlier and saves you from having to remember every check manually. But it can also be a little dangerous if you blindly trust every suggested fix, because some updates can break working code or change behavior in ways you did not expect. So it helps with detection, but you still need judgment.
+
+**Which vulnerabilities were most challenging to address?**  
+Honestly, balancing everything together was the hardest part. Validation, encoding, encryption, sessions, and dependency issues all connect to each other, so it was less about one single bug and more about making sure the whole flow was actually secure and still worked properly.
+
+**What additional testing tools or strategies could improve the process?**  
+Manual testing helped, but better automated testing would make this a lot stronger. Tools like OWASP ZAP or Burp Suite would be useful, and even just adding more repeatable tests for validation and encryption would make it easier to catch mistakes faster.
+
+
+## Troubleshooting
+
+- If startup shows missing certificate errors, generate the local certificate files in the `certs/` folder with the OpenSSL command above.
+- If `ENCRYPTION_KEY` is missing or invalid, update `.env` with a valid 64-character hex string.
+- If the browser blocks the page, accept the local self-signed certificate warning for `https://localhost:3000`.
+- If CSRF errors appear after sitting idle, reload the page and try again.
+- If port 3000 is already in use, stop the other process or change the port in the server configuration.
+

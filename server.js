@@ -12,15 +12,26 @@ const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const rateLimit = require('express-rate-limit');
 const csurf = require('csurf');
+const { body, validationResult } = require('express-validator');
+const { encrypt, decrypt } = require('./crypto-utils');
+
+const { renderDashboardPage } = require('./views/dashboard');
+const { renderLoginPage } = require('./views/login');
+const { renderRegisterPage } = require('./views/register');
+const { renderHomePage } = require('./views/home');
 
 const app = express();
 const PORT = 3000;
 
 app.use(helmet());
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
 
-// session for oauth
+// serving assets
+app.use('/static', express.static(path.join(__dirname, 'public')));
+
+// session setup
 app.use(
   session({
     secret: process.env.JWT_SECRET, 
@@ -34,11 +45,11 @@ app.use(
 app.use(passport.initialize());
 app.use(passport.session());
 
-// csrf on cookies
+// csrf using cookies
 const csrfProtection = csurf({ cookie: true });
 app.use(csrfProtection);
 
-// slow down login spam
+// rate limit login
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, 
   max: 10, 
@@ -47,16 +58,28 @@ const loginLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// csrf errors
-app.use((err, req, res, next) => {
-  if (err.code === 'EBADCSRFTOKEN') {
-    res.status(403).json({ error: 'Invalid CSRF token' });
-  } else {
-    next(err);
-  }
-});
-
 const authenticateJWT = (req, res, next) => {
+  const token = req.cookies.token;
+
+  if (!token) {
+    return res.redirect('/login');
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    if (error instanceof jwt.TokenExpiredError) {
+      res.clearCookie('token');
+      return res.redirect('/login');
+    }
+    return res.redirect('/login');
+  }
+};
+
+// api jwt check
+const authenticateJWTapi = (req, res, next) => {
   const token = req.cookies.token;
 
   if (!token) {
@@ -88,7 +111,7 @@ app.get('/csrf-token', (req, res) => {
   res.json({ csrfToken: req.csrfToken() });
 });
 
-app.get('/profile', authenticateJWT, (req, res) => {
+app.get('/profile', authenticateJWTapi, (req, res) => {
   res.json({
     message: 'Your Profile',
     user: req.user
@@ -96,7 +119,7 @@ app.get('/profile', authenticateJWT, (req, res) => {
 });
 
 
-app.get('/admin', authenticateJWT, authorizeRoles('Admin'), (req, res) => {
+app.get('/admin', authenticateJWTapi, authorizeRoles('Admin'), (req, res) => {
   res.json({
     message: 'Welcome to the Admin Panel',
     adminData: {
@@ -106,24 +129,6 @@ app.get('/admin', authenticateJWT, authorizeRoles('Admin'), (req, res) => {
     }
   });
 });
-
-app.get('/dashboard', authenticateJWT, (req, res) => {
-  const { username, role } = req.user;
-
-  if (role === 'Admin') {
-    res.json({
-      message: `Admin Dashboard for ${username}`,
-      adminWidgets: ['User Management', 'Content Moderation', 'System Analytics']
-    });
-  } else {
-    res.json({
-      message: `User Dashboard for ${username}`,
-      userWidgets: ['My Posts', 'My Favorites', 'Account Settings']
-    });
-  }
-});
-
-
 
 
 function cacheControl(value) {
@@ -173,7 +178,7 @@ const posts = [
   }
 ];
 
-// demo user store
+// dummy user store: bio/email encrypted after profile hit
 const users = [
   {
     id: 1,
@@ -182,37 +187,183 @@ const users = [
       '$2b$10$E9CM4lQ5/2e.3Tpr.1Yfje3C.UPgBv6l7h2ED323iIu2eGsn3gRjS',
     role: 'Admin',
     oauthProvider: null,
-    oauthId: null
+    oauthId: null,
+    name: 'Maya',
+    email: '',   // will be encrypted after first profile update
+    bio: ''      // will be encrypted after first profile update
   }
 ];
 
+
+// views
+// ──────────────────────────────────────────────────────────────────
+
+// Login page
+app.get('/login', (req, res) => {
+  // If already logged in, go to home
+  const token = req.cookies.token;
+  if (token) {
+    try {
+      jwt.verify(token, process.env.JWT_SECRET);
+      return res.redirect('/home');
+    } catch (_) { /* invalid token */ }
+  }
+
+  res.type('html').send(renderLoginPage({
+    csrfToken: req.csrfToken(),
+    error: null
+  }));
+});
+
+// Register page
+app.get('/register', (req, res) => {
+  res.type('html').send(renderRegisterPage({
+    csrfToken: req.csrfToken(),
+    error: null,
+    success: null
+  }));
+});
+
+// authenticated landing page
+app.get('/home', authenticateJWT, (req, res) => {
+  const user = users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    res.clearCookie('token');
+    return res.redirect('/login');
+  }
+
+  res.type('html').send(renderHomePage({
+    csrfToken: req.csrfToken(),
+    user: {
+      username: user.username,
+      name: user.name || user.username,
+      role: user.role
+    }
+  }));
+});
+
+// secure dashboard
+app.get('/dashboard', authenticateJWT, (req, res) => {
+  const user = users.find((u) => u.id === req.user.id);
+
+  if (!user) {
+    res.clearCookie('token');
+    return res.redirect('/login');
+  }
+
+  // decrypt entries for display
+  const decryptedEmail = decrypt(user.email || '');
+  const decryptedBio = decrypt(user.bio || '');
+
+  // session flash check
+  const flash = req.session.flash || null;
+  delete req.session.flash;
+
+  res.type('html').send(renderDashboardPage({
+    csrfToken: req.csrfToken(),
+    logoutPath: '/auth/logout',
+    updatePath: '/dashboard/update',
+    user: {
+      id: user.id,
+      username: user.username,
+      name: user.name || user.username,
+      email: decryptedEmail,
+      bio: decryptedBio,
+      role: user.role
+    },
+    flash
+  }));
+});
+
+
+// profile update: validate/sanitise/encrypt
+
+// validation rules per assignment requirements
+const profileValidation = [
+  body('name')
+    .trim()
+    .isLength({ min: 3, max: 50 }).withMessage('Name must be 3–50 characters.')
+    .matches(/^[A-Za-z\s]+$/).withMessage('Name must contain only letters and spaces.'),
+
+  body('email')
+    .trim()
+    .isEmail().withMessage('Please enter a valid email address.')
+    .normalizeEmail(),
+
+  body('bio')
+    .trim()
+    .isLength({ max: 500 }).withMessage('Bio must be 500 characters or fewer.')
+    .custom((value) => {
+      // block tags
+      if (/<[^>]*>/.test(value)) {
+        throw new Error('Bio must not contain HTML tags.');
+      }
+      // basic character only
+      if (/[^A-Za-z0-9\s.,!?;:'"()\-\n\r]/.test(value)) {
+        throw new Error('Bio must not contain special characters.');
+      }
+      return true;
+    })
+];
+
+app.post('/dashboard/update', authenticateJWT, profileValidation, (req, res) => {
+  const errors = validationResult(req);
+
+  if (!errors.isEmpty()) {
+    // map errors by field
+    const errorMap = {};
+    errors.array().forEach((e) => {
+      if (!errorMap[e.path]) {
+        errorMap[e.path] = e.msg;
+      }
+    });
+
+    req.session.flash = {
+      type: 'error',
+      message: 'Please fix the errors below.',
+      errors: errorMap
+    };
+    return req.session.save(() => res.redirect('/dashboard'));
+  }
+
+  const user = users.find((u) => u.id === req.user.id);
+  if (!user) {
+    res.clearCookie('token');
+    return res.redirect('/login');
+  }
+
+  // sanitized values via express-validator
+  const { name, email, bio } = req.body;
+
+  // encrypt and store
+  user.name = name;
+  user.email = encrypt(email);
+  user.bio = encrypt(bio || '');
+
+  // logging for demo check
+  console.log(`[Profile Updated] user=${user.username}`);
+  console.log(`  name (plain): ${user.name}`);
+  console.log(`  email (encrypted): ${user.email}`);
+  console.log(`  bio (encrypted): ${user.bio}`);
+
+  req.session.flash = {
+    type: 'success',
+    message: 'Profile updated successfully.'
+  };
+  req.session.save(() => res.redirect('/dashboard'));
+});
+
+
+// api endpoints (phase 2)
+// ──────────────────────────────────────────────────────────────────
 
 app.get('/health', cacheControl(cachePolicies.noStore), (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 app.get('/', cacheControl(cachePolicies.noStore), (req, res) => {
-  res.type('html').send(`<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Photo App - API is Running</title>
-  </head>
-  <body>
-    <h1>Photo App - API is Running</h1>
-    <p>This local HTTPS server powers the photo sharing app API.</p>
-    <ul>
-      <li><a href="/posts">/posts</a></li>
-      <li><a href="/posts/1">/posts/1</a></li>
-      <li><a href="/feed/public">/feed/public</a></li>
-      <li><a href="/users/maya">/users/maya</a></li>
-      <li><a href="/tags/sunset">/tags/sunset</a></li>
-      <li><a href="/health">/health</a></li>
-      <li><a href="/config/public">/config/public</a></li>
-    </ul>
-  </body>
-</html>`);
+  res.redirect('/login');
 });
 
 app.get('/posts', cacheControl(cachePolicies.postsList), (req, res) => {
@@ -273,7 +424,7 @@ app.get('/config/public', cacheControl(cachePolicies.staticConfig), (req, res) =
   });
 });
 
-// no cache here
+// post creation
 app.post('/posts', cacheControl(cachePolicies.noStore), (req, res) => {
   const { author, caption, imageUrl, tags } = req.body;
 
@@ -309,7 +460,7 @@ app.post('/posts/:id/like', cacheControl(cachePolicies.noStore), (req, res) => {
   return res.status(200).json({ id: post.id, likes: post.likes });
 });
 
-app.get('/feed/me', authenticateJWT, (req, res) => {
+app.get('/feed/me', authenticateJWTapi, (req, res) => {
   const userPosts = posts.filter(
     (post) => post.author.toLowerCase() === req.user.username.toLowerCase()
   );
@@ -349,7 +500,10 @@ passport.use(
           hashedPassword: null,
           role: 'User',
           oauthProvider: 'google',
-          oauthId: googleId
+          oauthId: googleId,
+          name: displayName,
+          email: '',
+          bio: ''
         };
         users.push(newUser);
         return done(null, newUser);
@@ -372,7 +526,7 @@ app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'em
 app.get(
   '/auth/google/callback',
   passport.authenticate('google', {
-    failureRedirect: '/login-error',
+    failureRedirect: '/login',
     session: false
   }),
   (req, res) => {
@@ -394,16 +548,39 @@ app.get(
         maxAge: 60 * 60 * 1000 // 1 hour
       });
 
-      res.redirect('/feed/me');
+      res.redirect('/home');
     });
   }
 );
 
+// account creation
 app.post('/auth/register', async (req, res) => {
   const { username, password } = req.body;
 
   if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password are required' });
+    return res.type('html').send(renderRegisterPage({
+      csrfToken: req.csrfToken(),
+      error: 'Username and password are required.',
+      success: null
+    }));
+  }
+
+  // Validate username: 3–50 characters (alphanumeric, periods, underscores, dashes)
+  if (!/^[A-Za-z0-9._-]{3,50}$/.test(username)) {
+    return res.type('html').send(renderRegisterPage({
+      csrfToken: req.csrfToken(),
+      error: 'Username must be 3–50 characters (letters, numbers, ., _, -).',
+      success: null
+    }));
+  }
+
+  // Validate password: at least 8 characters
+  if (password.length < 8) {
+    return res.type('html').send(renderRegisterPage({
+      csrfToken: req.csrfToken(),
+      error: 'Password must be at least 8 characters.',
+      success: null
+    }));
   }
 
   try {
@@ -412,7 +589,11 @@ app.post('/auth/register', async (req, res) => {
     );
 
     if (existingUser) {
-      return res.status(409).json({ error: 'Username already exists' });
+      return res.type('html').send(renderRegisterPage({
+        csrfToken: req.csrfToken(),
+        error: 'Username already exists.',
+        success: null
+      }));
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -423,18 +604,26 @@ app.post('/auth/register', async (req, res) => {
       hashedPassword,
       role: 'User',
       oauthProvider: null,
-      oauthId: null
+      oauthId: null,
+      name: username,
+      email: '',
+      bio: ''
     };
 
     users.push(newUser);
 
-    res.status(201).json({
-      message: 'User registered successfully',
-      user: { id: newUser.id, username: newUser.username }
-    });
+    res.type('html').send(renderRegisterPage({
+      csrfToken: req.csrfToken(),
+      error: null,
+      success: 'Account created! You can now log in.'
+    }));
   } catch (error) {
     console.error('Registration error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.type('html').send(renderRegisterPage({
+      csrfToken: req.csrfToken(),
+      error: 'Something went wrong. Please try again.',
+      success: null
+    }));
   }
 });
 
@@ -446,11 +635,15 @@ const generateToken = (user) => {
   );
 };
 
+// login post
 app.post('/auth/login', loginLimiter, async (req, res) => {
   const { username, password } = req.body;
 
   if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password are required' });
+    return res.type('html').send(renderLoginPage({
+      csrfToken: req.csrfToken(),
+      error: 'Username and password are required.'
+    }));
   }
 
   try {
@@ -459,20 +652,29 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
     );
 
     if (!user || !user.hashedPassword) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+      return res.type('html').send(renderLoginPage({
+        csrfToken: req.csrfToken(),
+        error: 'Invalid username or password.'
+      }));
     }
 
     const isMatch = await bcrypt.compare(password, user.hashedPassword);
 
     if (!isMatch) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+      return res.type('html').send(renderLoginPage({
+        csrfToken: req.csrfToken(),
+        error: 'Invalid username or password.'
+      }));
     }
 
-    // reset session on login
+    // clear session on login
     req.session.regenerate((err) => {
       if (err) {
         console.error('Session regeneration error:', err);
-        return res.status(500).json({ error: 'Internal server error' });
+        return res.type('html').send(renderLoginPage({
+          csrfToken: req.csrfToken(),
+          error: 'Something went wrong. Please try again.'
+        }));
       }
 
       req.session.user = user;
@@ -486,20 +688,23 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
         maxAge: 60 * 60 * 1000 
       });
 
-      res.json({
-        message: 'Login successful',
-        user: { id: user.id, username: user.username, role: user.role }
-      });
+      res.redirect('/home');
     });
   } catch (error) {
     console.error('Login error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.type('html').send(renderLoginPage({
+      csrfToken: req.csrfToken(),
+      error: 'Something went wrong. Please try again.'
+    }));
   }
 });
 
+// logout handle
 app.post('/auth/logout', (req, res) => {
   res.clearCookie('token');
-  res.json({ message: 'Logout successful' });
+  req.session.destroy(() => {
+    res.redirect('/login');
+  });
 });
 
 app.post('/auth/forgot-password', (req, res) => {
@@ -514,6 +719,15 @@ app.post('/auth/forgot-password', (req, res) => {
     message:
       'If an account with that email exists, a password reset link has been sent.'
   });
+});
+
+
+// csrf error handler (after routes)
+app.use((err, req, res, next) => {
+  if (err.code === 'EBADCSRFTOKEN') {
+    return res.status(403).send('Invalid or missing CSRF token. Please go back and try again.');
+  }
+  next(err);
 });
 
 
