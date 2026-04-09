@@ -68,6 +68,7 @@ const authenticateJWT = (req, res, next) => {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.user = decoded;
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     next();
   } catch (error) {
     if (error instanceof jwt.TokenExpiredError) {
