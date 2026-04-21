@@ -32,12 +32,24 @@ app.use(cookieParser());
 app.use('/static', express.static(path.join(__dirname, 'public')));
 
 // session setup
+// use a dedicated secret so session and jwt keys don't share a lifetime
+const SESSION_SECRET = process.env.SESSION_SECRET || process.env.JWT_SECRET;
+if (!SESSION_SECRET) {
+  console.error('SESSION_SECRET (or JWT_SECRET fallback) must be set.');
+  process.exit(1);
+}
 app.use(
   session({
-    secret: process.env.JWT_SECRET, 
+    name: 'sid',
+    secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: true }
+    cookie: {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'lax',
+      maxAge: 60 * 60 * 1000
+    }
   })
 );
 
@@ -54,6 +66,24 @@ const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, 
   max: 10, 
   message: 'Too many login attempts from this IP, please try again after 15 minutes',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// rate limit account creation (prevents mass register abuse)
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  message: 'Too many accounts created from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// rate limit forgot-password (prevents email enumeration / spam)
+const forgotPasswordLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  message: 'Too many password reset requests, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -82,6 +112,9 @@ const authenticateJWT = (req, res, next) => {
 // api jwt check
 const authenticateJWTapi = (req, res, next) => {
   const token = req.cookies.token;
+
+  // protected api responses should never be cached
+  res.set('Cache-Control', 'no-store');
 
   if (!token) {
     return res.status(401).json({ error: 'Access denied. No token provided.' });
@@ -437,19 +470,38 @@ app.get('/config/public', cacheControl(cachePolicies.staticConfig), (req, res) =
   });
 });
 
-// post creation
-app.post('/posts', cacheControl(cachePolicies.noStore), (req, res) => {
-  const { author, caption, imageUrl, tags } = req.body;
+// post creation validation
+const postValidation = [
+  body('caption')
+    .exists().withMessage('caption is required')
+    .bail()
+    .isString().withMessage('caption must be a string')
+    .trim()
+    .isLength({ min: 1, max: 500 }).withMessage('caption must be 1–500 characters')
+    .matches(/^[^<>]*$/).withMessage('caption must not contain < or >'),
+  body('imageUrl')
+    .exists().withMessage('imageUrl is required')
+    .bail()
+    .isString()
+    .trim()
+    .isLength({ max: 500 })
+    .matches(/^(https?:\/\/|\/)[^\s<>"']+$/i).withMessage('imageUrl must be a valid http(s) or absolute path url'),
+  body('tags').optional().isArray({ max: 20 }).withMessage('tags must be an array with up to 20 items'),
+  body('tags.*').optional().isString().isLength({ max: 40 }).matches(/^[A-Za-z0-9._-]+$/)
+];
 
-  if (!author || !caption || !imageUrl) {
-    return res.status(400).json({
-      error: 'author, caption, and imageUrl are required'
-    });
+// post creation - auth required, author is always taken from the jwt
+app.post('/posts', authenticateJWTapi, postValidation, (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: 'Invalid input', details: errors.array() });
   }
+
+  const { caption, imageUrl, tags } = req.body;
 
   const newPost = {
     id: posts.length + 1,
-    author,
+    author: req.user.username,
     caption,
     imageUrl,
     tags: Array.isArray(tags) ? tags : [],
@@ -461,10 +513,13 @@ app.post('/posts', cacheControl(cachePolicies.noStore), (req, res) => {
   return res.status(201).json(newPost);
 });
 
-app.post('/posts/:id/like', cacheControl(cachePolicies.noStore), (req, res) => {
+app.post('/posts/:id/like', authenticateJWTapi, (req, res) => {
   const postId = Number(req.params.id);
-  const post = posts.find((item) => item.id === postId);
+  if (!Number.isInteger(postId) || postId <= 0) {
+    return res.status(400).json({ error: 'Invalid post id' });
+  }
 
+  const post = posts.find((item) => item.id === postId);
   if (!post) {
     return res.status(404).json({ error: 'Post not found' });
   }
@@ -484,7 +539,7 @@ app.get('/feed/me', authenticateJWTapi, (req, res) => {
   });
 });
 
-app.get('/admin/review-queue', cacheControl(cachePolicies.noStore), (req, res) => {
+app.get('/admin/review-queue', authenticateJWTapi, authorizeRoles('Admin'), (req, res) => {
   res.json({
     queueCount: 0,
     note: 'Admin route not built yet. no-store stays on.'
@@ -551,7 +606,7 @@ app.get(
       }
 
       const user = req.user;
-      req.session.user = user;
+      req.session.user = { id: user.id, username: user.username, role: user.role };
 
       const token = generateToken(user);
 
@@ -567,46 +622,41 @@ app.get(
   }
 );
 
+// registration validation - kept in line with profile validation
+const registerValidation = [
+  body('username')
+    .exists().withMessage('Username is required.').bail()
+    .isString().trim()
+    .isLength({ min: 3, max: 50 }).withMessage('Username must be 3–50 characters.')
+    .matches(/^[A-Za-z0-9._-]+$/).withMessage('Username must contain only letters, numbers, ., _, -'),
+  body('email')
+    .exists().withMessage('Email is required.').bail()
+    .isString().trim()
+    .isEmail().withMessage('Please enter a valid email address.')
+    .isLength({ max: 254 })
+    .normalizeEmail(),
+  body('password')
+    .exists().withMessage('Password is required.').bail()
+    .isString()
+    .isLength({ min: 8, max: 128 }).withMessage('Password must be at least 8 characters.')
+    .matches(/[A-Za-z]/).withMessage('Password must contain at least one letter.')
+    .matches(/[0-9]/).withMessage('Password must contain at least one number.')
+];
+
 // account creation
-app.post('/auth/register', async (req, res) => {
+app.post('/auth/register', registerLimiter, registerValidation, async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    const firstError = errors.array()[0];
+    return res.type('html').send(renderRegisterPage({
+      csrfToken: req.csrfToken(),
+      error: firstError.msg,
+      success: null
+    }));
+  }
+
   const { username, email, password } = req.body;
-  const normalizedEmail = email ? email.trim().toLowerCase() : '';
-
-  if (!username || !email || !password) {
-    return res.type('html').send(renderRegisterPage({
-      csrfToken: req.csrfToken(),
-      error: 'Username, email, and password are required.',
-      success: null
-    }));
-  }
-
-  // Validate email format
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!emailRegex.test(normalizedEmail)) {
-    return res.type('html').send(renderRegisterPage({
-      csrfToken: req.csrfToken(),
-      error: 'Please enter a valid email address.',
-      success: null
-    }));
-  }
-
-  // Validate username: 3–50 characters (alphanumeric, periods, underscores, dashes)
-  if (!/^[A-Za-z0-9._-]{3,50}$/.test(username)) {
-    return res.type('html').send(renderRegisterPage({
-      csrfToken: req.csrfToken(),
-      error: 'Username must be 3–50 characters (letters, numbers, ., _, -).',
-      success: null
-    }));
-  }
-
-  // Validate password: at least 8 characters
-  if (password.length < 8) {
-    return res.type('html').send(renderRegisterPage({
-      csrfToken: req.csrfToken(),
-      error: 'Password must be at least 8 characters.',
-      success: null
-    }));
-  }
+  const normalizedEmail = email; // already normalized
 
   try {
     const existingUser = users.find(
@@ -705,7 +755,8 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
         }));
       }
 
-      req.session.user = user;
+      // don't persist the hashed password / full record in session
+      req.session.user = { id: user.id, username: user.username, role: user.role };
 
       const token = generateToken(user);
 
@@ -735,19 +786,27 @@ app.post('/auth/logout', (req, res) => {
   });
 });
 
-app.post('/auth/forgot-password', (req, res) => {
-  const { email } = req.body;
+app.post(
+  '/auth/forgot-password',
+  forgotPasswordLimiter,
+  body('email').exists().isString().trim().isEmail().isLength({ max: 254 }).normalizeEmail(),
+  (req, res) => {
+    const errors = validationResult(req);
+    if (errors.isEmpty() === false) {
+      // same generic response to avoid email enumeration
+      return res.status(200).json({
+        message:
+          'If an account with that email exists, a password reset link has been sent.'
+      });
+    }
 
-  if (!email) {
-    return res.status(400).json({ error: 'Email address is required' });
+    // fake reset response (no email infra in this project)
+    res.status(200).json({
+      message:
+        'If an account with that email exists, a password reset link has been sent.'
+    });
   }
-
-  // fake reset response (for now)
-  res.status(200).json({
-    message:
-      'If an account with that email exists, a password reset link has been sent.'
-  });
-});
+);
 
 
 // csrf error handler (after routes)
